@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mapillary-collector"
+version = "1.0.0"
+description = "Collect a geolocated street-level image dataset from Mapillary"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "shapely>=2.0",
+    "pillow>=10.0",
+    "huggingface_hub>=0.23",
+    "vt2geojson>=0.2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+mapillary = "mapillary_collector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
