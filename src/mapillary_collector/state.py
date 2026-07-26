@@ -287,6 +287,35 @@ class StateDB:
             ).fetchone()
         return None if row is None else row[0]
 
+    def countries_missing_images(self, statuses: tuple) -> list:
+        """Countries marked finished that never actually collected anything.
+
+        Only ever the result of a bug or an outage, so the pipeline reopens
+        them automatically rather than skipping them forever.
+        """
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT name FROM countries WHERE status IN ({placeholders}) "
+                "AND name NOT IN (SELECT DISTINCT country FROM images)",
+                tuple(statuses),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def clear_base_scan(self, country: str, base_zoom: int) -> None:
+        """Forget a country's coarse scan so the next run redoes it from scratch."""
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM tiles WHERE country=? AND z=?",
+                              (country, base_zoom))
+            self.conn.execute("DELETE FROM kv WHERE key=?", (f"base_done:{country}",))
+
+    def reset_error_tiles(self) -> int:
+        """Make previously errored tiles pending again."""
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE tiles SET status=? WHERE status=?", (TILE_PENDING, "error"))
+        return cur.rowcount
+
     def countries_by_status(self, status: str) -> list:
         with self._lock:
             return self.conn.execute(
@@ -337,12 +366,13 @@ class StateDB:
             )
             return self.conn.total_changes - before
 
-    def pending_tiles(self, country: str, limit: int) -> list:
+    def pending_tiles(self, country: str, limit: int, offset: int = 0) -> list:
+        """Offset lets a caller page past tiles it has already tried this run."""
         with self._lock:
             return self.conn.execute(
                 "SELECT z, x, y, tile_rank FROM tiles "
-                "WHERE country=? AND status=? ORDER BY tile_rank LIMIT ?",
-                (country, TILE_PENDING, limit),
+                "WHERE country=? AND status=? ORDER BY tile_rank LIMIT ? OFFSET ?",
+                (country, TILE_PENDING, limit, offset),
             ).fetchall()
 
     def count_pending_tiles(self, country: str) -> int:
@@ -350,15 +380,6 @@ class StateDB:
             row = self.conn.execute(
                 "SELECT COUNT(*) FROM tiles WHERE country=? AND status=?",
                 (country, TILE_PENDING),
-            ).fetchone()
-        return int(row[0])
-
-    def count_known_tiles(self, country: str) -> int:
-        """Every leaf tile we know has coverage, fetched or not -- the quota input."""
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT COUNT(*) FROM tiles WHERE country=? AND z=? ",
-                (country, self.kv_get("leaf_zoom", 14)),
             ).fetchone()
         return int(row[0])
 

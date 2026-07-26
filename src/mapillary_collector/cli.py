@@ -39,10 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quota-alpha", type=float, help="quota exponent (0.5 = sqrt)")
     run.add_argument("--include-panoramas", action="store_true", default=None)
     run.add_argument("--min-quality", type=float, dest="min_quality_score")
+    run.add_argument("--retry-exhausted", action="store_true", default=None,
+                     dest="retry_exhausted",
+                     help="revisit countries previously found to have no coverage")
     run.add_argument("--dry-run", action="store_true", default=None,
                      dest="dry_run_uploads", help="collect but never upload")
 
     sub.add_parser("status", help="progress summary")
+    sub.add_parser("repair", help="undo outage damage: requeue tiles, reopen countries")
     sub.add_parser("doctor", help="pre-flight check")
     sub.add_parser("quota", help="preview the quota curve")
 
@@ -79,6 +83,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         "include_panoramas": getattr(args, "include_panoramas", None),
         "min_quality_score": getattr(args, "min_quality_score", None),
         "dry_run_uploads": getattr(args, "dry_run_uploads", None),
+        "retry_exhausted": getattr(args, "retry_exhausted", None),
     }
     countries = getattr(args, "countries", None)
     if countries:
@@ -120,6 +125,8 @@ def main(argv=None) -> int:
         diagnostics.verify_local(cfg)
         if args.remote:
             diagnostics.verify_remote(cfg)
+    elif args.command == "repair":
+        diagnostics.repair(cfg)
     elif args.command == "reset":
         diagnostics.reset(cfg, args.confirm)
     return 0

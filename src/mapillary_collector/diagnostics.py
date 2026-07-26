@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from .config import Config, resolve_token
 from .constants import SHARD_LOCAL, SHARD_UPLOADED, SHARD_UPLOADING
 from .logging_setup import get_logger
-from .quota import quota_table
+from .quota import compute_quota, quota_table
 from .staging import StagingArea, inspect_tar
 from .state import StateDB
 from .upload import HfStore
@@ -33,10 +33,44 @@ def status(cfg: Config) -> None:
         print(f"countries    : {totals['countries']}")
         print(f"candidates   : {human_count(totals['candidates'])}")
         print(f"disk free    : {disk_free_gb(cfg.data_dir):.1f} GB")
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        used = int(db.kv_get(f"tile_budget:{day}", 0) or 0)
+        print(f"tiles today  : {used}/{cfg.daily_tile_budget}")
         rows = db.countries_by_status("in_progress")
         for name, quota, tiles in rows:
             have = db.images_in_country(name)
             print(f"in progress  : {name} {have}/{quota} (tiles={tiles})")
+    finally:
+        db.close()
+
+
+def repair(cfg: Config) -> None:
+    """Undo the damage an outage leaves behind.
+
+    Tiles that failed while the server was refusing us were recorded as dead by
+    older versions, and countries whose discovery failed got marked finished
+    with zero images. Both are reversible; this reverses them.
+    """
+    db = _open_db(cfg)
+    try:
+        revived = db.reset_error_tiles()
+        print(f"returned {revived} errored tile(s) to the queue")
+
+        stale = db.countries_missing_images(("completed", "exhausted"))
+        for name in stale:
+            db.upsert_country(name, "in_progress")
+            db.clear_base_scan(name, cfg.tile_base_zoom)
+        print(f"reopened {len(stale)} country(ies) that collected nothing"
+              + (": " + ", ".join(sorted(stale)[:10]) if stale else ""))
+
+        reopened = 0
+        for name, quota, tiles in db.countries_by_status("completed"):
+            have = db.images_in_country(name)
+            fresh = compute_quota(tiles or 0, cfg)
+            if fresh > have:
+                db.upsert_country(name, "in_progress", quota=fresh)
+                reopened += 1
+        print(f"reopened {reopened} country(ies) whose quota grew")
     finally:
         db.close()
 

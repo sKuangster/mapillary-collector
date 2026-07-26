@@ -29,7 +29,7 @@ from .constants import (
     COUNTRY_IN_PROGRESS,
     SHARD_LOCAL,
 )
-from .discovery import TileDiscovery
+from .discovery import TileDiscovery, TileQuotaExhausted
 from .filters import evaluate_image, prefilter_candidate, validate_image_bytes
 from .geo import CountryRec, load_countries
 from .logging_setup import log_config_summary
@@ -123,6 +123,11 @@ class Pipeline:
             else:
                 self.log.info("[DONE] all countries processed")
             self._finalize("complete")
+        except TileQuotaExhausted as exc:
+            self.log.error("[TILES] %s", exc)
+            self.log.error("[TILES] stopping cleanly. No country was marked empty; "
+                           "rerun later and discovery resumes where it stopped.")
+            self._finalize("tile_quota")
         except (KeyboardInterrupt, ShutdownRequested):
             self.log.warning("[SHUTDOWN] interrupted, saving state")
             self._finalize("interrupt")
@@ -132,7 +137,10 @@ class Pipeline:
             raise
 
     def _run_countries(self, countries: list) -> None:
-        skip = {COUNTRY_COMPLETED, COUNTRY_EXHAUSTED, COUNTRY_FAILED}
+        self._reopen_empty_countries()
+        skip = {COUNTRY_COMPLETED, COUNTRY_FAILED}
+        if not self.cfg.retry_exhausted:
+            skip.add(COUNTRY_EXHAUSTED)
         for rec in countries:
             if self._stop.is_set():
                 return
@@ -144,6 +152,29 @@ class Pipeline:
                 self.log.warning("[COUNTRY] %s has no usable polygon", rec.name)
                 continue
             self._collect_country(rec)
+
+    def _reopen_empty_countries(self) -> None:
+        """Undo any country that got marked finished without collecting anything.
+
+        A country only earns a terminal status by actually being walked to the
+        end. Zero images plus a terminal status means an outage wrote it off, so
+        reopen it -- otherwise one bad hour silently removes a country from the
+        dataset forever.
+        """
+        stale = self.db.countries_missing_images(
+            (COUNTRY_COMPLETED, COUNTRY_EXHAUSTED))
+        for name in stale:
+            self.db.upsert_country(name, COUNTRY_IN_PROGRESS)
+            self.db.clear_base_scan(name, self.cfg.tile_base_zoom)
+        if stale:
+            self.log.warning("[RECOVERY] reopened %d country(ies) marked finished "
+                             "with zero images: %s", len(stale),
+                             ", ".join(sorted(stale)[:8])
+                             + (" ..." if len(stale) > 8 else ""))
+        revived = self.db.reset_error_tiles()
+        if revived:
+            self.log.info("[RECOVERY] returned %d errored tile(s) to the queue",
+                          revived)
 
     # ---- per country --------------------------------------------------
 
@@ -162,36 +193,81 @@ class Pipeline:
                                quota=quota, leaf_tiles=leaf_tiles)
 
         if quota == 0:
-            self.db.upsert_country(rec.name, COUNTRY_EXHAUSTED,
-                                   finished_at=utc_now_iso())
-            self.log.info("[COUNTRY] %s: no coverage found, skipping", rec.name)
+            # zero coverage is only believable when discovery actually finished.
+            # otherwise the tile server was unavailable and this country still
+            # has data waiting -- keep it open rather than writing it off
+            if discovery.discovery_complete():
+                self.db.upsert_country(rec.name, COUNTRY_EXHAUSTED,
+                                       finished_at=utc_now_iso())
+                self.log.info("[COUNTRY] %s: no coverage on Mapillary", rec.name)
+            else:
+                self.log.warning("[COUNTRY] %s: discovery incomplete, leaving open "
+                                 "for a later run", rec.name)
             return
         if already >= quota:
             self.db.upsert_country(rec.name, COUNTRY_COMPLETED,
                                    finished_at=utc_now_iso())
             return
 
-        self.log.info("[COUNTRY] %s: %d leaf tiles -> quota %d (have %d)",
-                      rec.name, leaf_tiles, quota, already)
-
-        discovery.harvest(quota * self.cfg.candidate_multiplier)
-        self.log.info("[TILES] %s: %d candidates from %d leaf fetches",
-                      rec.name, self.db.candidates_count(rec.name),
-                      discovery.leaf_fetches)
+        self.log.info("[COUNTRY] %s: %d leaf tiles -> quota %d (have %d, "
+                      "%d tiles used today)", rec.name, leaf_tiles, quota, already,
+                      discovery.tiles_used_today())
 
         collected = already
         skips: Counter = Counter()
         processed = 0
-        consecutive_errors = 0
+        walked_out = False
 
+        # alternate between walking known candidates and discovering more, so a
+        # country is never abandoned while it still has unexplored coverage
+        while collected < quota and not self._stop.is_set():
+            target = quota * self.cfg.candidate_multiplier
+            if self.db.candidates_count(rec.name) < target:
+                discovery.harvest(target)
+                self.log.info("[TILES] %s: %d candidates, %d leaf fetches this run",
+                              rec.name, self.db.candidates_count(rec.name),
+                              discovery.leaf_fetches)
+
+            before = collected
+            collected, processed, walked_out = self._walk_candidates(
+                rec, quota, collected, processed, skips)
+            if collected >= quota or self._stop.is_set():
+                break
+            if not discovery.can_harvest_more():
+                break
+            if collected == before and not walked_out:
+                break  # neither collecting nor discovering: stop rather than spin
+
+        if collected >= quota:
+            status = COUNTRY_COMPLETED
+        elif discovery.discovery_complete() and walked_out:
+            # every tile fetched, every candidate seen, still short: this is the
+            # honest "that is all Mapillary has" case
+            status = COUNTRY_EXHAUSTED
+        else:
+            status = COUNTRY_IN_PROGRESS
+        self.db.upsert_country(rec.name, status, finished_at=utc_now_iso())
+        self.log.info("[COUNTRY] %s %s: %d/%d images from %d candidates; skips=%s",
+                      rec.name, status, collected, quota, processed, dict(skips))
+
+    def _walk_candidates(self, rec: CountryRec, quota: int, collected: int,
+                         processed: int, skips: Counter) -> tuple:
+        """Walk the candidate list once. Returns (collected, processed, walked_out).
+
+        walked_out is True only when the list was consumed to the end, which is
+        what distinguishes "ran out of data" from "stopped early".
+        """
+        consecutive_errors = 0
+        walked_out = True
         with ThreadPoolExecutor(max_workers=self.cfg.workers,
                                 thread_name_prefix="fetch") as pool:
             for batch in self.db.iter_candidates(rec.name,
                                                  batch=self.cfg.workers * 8):
                 if collected >= quota or self._stop.is_set():
+                    walked_out = False
                     break
 
-                # prefilter on the main thread: pure DB lookups, no network,
+                # prefilter on the main thread: pure indexed lookups, no network,
                 # so rejected candidates never occupy a worker
                 pending = []
                 for (_rank, _trank, image_id, lat, lng,
@@ -207,8 +283,7 @@ class Pipeline:
                 if not pending:
                     continue
 
-                results = pool.map(lambda i: self._fetch_one(i, rec), pending)
-                for outcome in results:
+                for outcome in pool.map(lambda i: self._fetch_one(i, rec), pending):
                     if outcome is None:
                         continue
                     kind, payload = outcome
@@ -230,27 +305,21 @@ class Pipeline:
                     if self._commit_image(row, data):
                         collected += 1
                     else:
-                        skips["duplicate_id"] += 1
-
+                        skips["raced_duplicate"] += 1
                     if collected >= quota:
+                        walked_out = False
                         break
 
+                if self._stop.is_set():
+                    walked_out = False
+                    break
                 if processed % self.cfg.status_every < len(batch):
                     self.log.info("[COUNTRY] %s: %d/%d images, %d candidates seen, "
                                   "staged=%d, interval=%.2fs",
                                   rec.name, collected, quota, processed,
                                   self.staging.count(),
                                   self.client.graph_limiter.interval)
-
-        if collected >= quota:
-            status = COUNTRY_COMPLETED
-        elif discovery.fully_harvested():
-            status = COUNTRY_EXHAUSTED
-        else:
-            status = COUNTRY_IN_PROGRESS  # more coverage remains for a later run
-        self.db.upsert_country(rec.name, status, finished_at=utc_now_iso())
-        self.log.info("[COUNTRY] %s %s: %d/%d images from %d candidates; skips=%s",
-                      rec.name, status, collected, quota, processed, dict(skips))
+        return collected, processed, walked_out
 
     def _fetch_one(self, image_id: str, rec: CountryRec):
         """Worker body: metadata, filters, download, validation. No shared state.
@@ -263,6 +332,12 @@ class Pipeline:
         except MapillaryError as exc:
             self.log.error("[API] %s", exc)
             return "error", str(exc)
+        except Exception as exc:
+            # a worker raising anything unexpected would propagate out of
+            # pool.map and end the whole run; one bad candidate is not worth that
+            self.log.error("[API] unexpected error on %s: %s: %s",
+                           image_id, type(exc).__name__, exc)
+            return "error", f"{type(exc).__name__}: {exc}"
         if meta is None:
             return "skip", "image_gone"  # deleted since the tile was built
 
@@ -279,7 +354,10 @@ class Pipeline:
             self.log.warning("[API] thumb failed (%s): %s", image_id, exc)
             return "skip", "download_failed"
 
-        ok, vreason, dims = validate_image_bytes(data, self.cfg)
+        try:
+            ok, vreason, dims = validate_image_bytes(data, self.cfg)
+        except Exception as exc:
+            return "skip", f"invalid:{type(exc).__name__}"
         if not ok:
             return "skip", f"invalid:{vreason}"
         if dims is not None:
@@ -289,9 +367,9 @@ class Pipeline:
     def _commit_image(self, row: dict, data: bytes) -> bool:
         """Register, stage, and pack when a full shard is ready. Main thread only."""
         self._check_disk()
-        # workers filter in parallel, so several images from one sequence or
-        # one coordinate cell can pass prefilter before any of them lands in
-        # the db. recheck here, on the single-threaded commit path
+        # workers filter in parallel, so several images from one sequence or one
+        # coordinate cell can pass prefilter before any of them reaches the db.
+        # recheck here, on the single-threaded commit path, where it is race-free
         seq = row.get("sequence")
         if seq and self.db.sequence_count(seq) >= self.cfg.max_per_sequence:
             return False

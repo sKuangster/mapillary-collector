@@ -27,6 +27,15 @@ class BadResponseError(MapillaryError):
     """HTTP said OK but the body was not the shape we expect."""
 
 
+class TileUnavailableError(MapillaryError):
+    """A tile could not be read *right now* -- quota, throttling, server hiccup.
+
+    Deliberately distinct from a permanent failure. The caller must leave such a
+    tile pending so a later run retries it; recording it as dead is how a bad
+    hour turns into a country permanently marked as having no coverage.
+    """
+
+
 class MapillaryClient:
     """Thread-safe. One instance is shared by every worker."""
 
@@ -88,11 +97,20 @@ class MapillaryClient:
         )
         if resp is None or not resp.content:
             return None
+        body = resp.content
+        # a vector tile is protobuf. an HTML or JSON body here means the server
+        # answered with an error page or a quota notice while still saying 200,
+        # so treat it as transient rather than as an empty tile
+        if body[:1] in (b"<", b"{"):
+            self.tile_limiter.penalize()
+            snippet = body[:80].decode("utf-8", "replace").replace("\n", " ")
+            raise TileUnavailableError(f"non-tile body ({ctx}): {snippet!r}")
         try:
-            return vt_bytes_to_geojson(resp.content, x, y, z)
+            return vt_bytes_to_geojson(body, x, y, z)
         except Exception as exc:  # protobuf decode failures come in many flavors
-            raise BadResponseError(
-                f"tile decode failed ({ctx}): {type(exc).__name__}") from exc
+            self.tile_limiter.penalize()
+            raise TileUnavailableError(
+                f"tile undecodable ({ctx}): {type(exc).__name__}") from exc
 
     def fetch_image_bytes(self, url: str, ctx: str) -> bytes:
         """Download thumbnail bytes from the CDN. Retried, but not rate-limited:

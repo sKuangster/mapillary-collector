@@ -43,14 +43,9 @@ class Config:
 
     # country selection
     countries_include: Optional[tuple] = None
-    countries_exclude: tuple = (
-    "Antarctica",
-    "North Korea",
-    "Turkmenistan",
-    "Western Sahara",
-    "Somaliland",
-    "Fr. S. Antarctic Lands", 
-    "S. Geo. and the Is.")
+    countries_exclude: tuple = ("Antarctica", "North Korea", "Turkmenistan",
+                                "Western Sahara", "Somaliland",
+                                "Fr. S. Antarctic Lands", "S. Geo. and the Is.")
 
     # quality filters
     include_panoramas: bool = False
@@ -63,9 +58,12 @@ class Config:
     rng_seed: int = 1337
     tile_base_zoom: int = 6           # coarse pass: where does coverage exist at all
     tile_leaf_zoom: int = 14          # leaf pass: per-image points with ids
-    candidate_multiplier: int = 3     # discover quota * this candidates before collecting
-    max_candidates_per_tile: int = 40
+    candidate_multiplier: int = 3
+    max_candidates_per_tile: int = 4
     max_leaf_tiles_per_country: int = 25000
+    daily_tile_budget: int = 45000    # stay under Mapillary's daily tile allowance
+    max_tile_failures: int = 40       # unreadable tiles before stopping the run
+    retry_exhausted: bool = False     # revisit countries previously found empty
 
     # networking
     workers: int = 6                  # parallel image fetches (network-bound, not CPU)
