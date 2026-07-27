@@ -52,3 +52,7 @@ TILE_PENDING = "pending"
 TILE_FETCHED = "fetched"
 TILE_EMPTY = "empty"
 TILE_ERROR = "error"
+MAPILLARY_IMAGES_URL = "https://graph.mapillary.com/images"
+TILE_LAYER_IMAGE = "image"
+TILE_LAYER_SEQUENCE = "sequence"
+PARENT_TILE_ZOOM = 10

@@ -377,7 +377,7 @@ class FakeClient:
         self.entity_calls = 0
         self.tile_calls = 0
 
-    def fetch_coverage_tile(self, z, x, y):
+    def fetch_coverage_tile(self, z, x, y, layer=None):
         self.tile_calls += 1
         w, s, e, n = geo.tile_bounds(z, x, y)
         if e < 0 or w > 10 or n < 0 or s > 10:
@@ -411,6 +411,15 @@ class FakeClient:
 
     def fetch_image_bytes(self, url, ctx):
         return make_jpeg()
+
+    def get_images_batch(self, image_ids):
+        out = {}
+        for image_id in image_ids:
+            meta = self.get_image(image_id)
+            if meta is not None:
+                out[str(image_id)] = meta
+        return out
+
 
 
 def _run_pipeline(cfg, client_factory=FakeClient):

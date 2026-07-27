@@ -65,6 +65,11 @@ class Config:
     max_tile_failures: int = 40       # unreadable tiles before stopping the run
     retry_exhausted: bool = False     # revisit countries previously found empty
 
+    # a z14 tile's images mostly come from a handful of drives. taking them in id
+    # order means every pick lands in one sequence and all but the first few are
+    # rejected by max_per_sequence, so picks are interleaved across sequences
+    prefer_distinct_sequences: bool = True
+
     # unattended operation
     forever: bool = True              # on tile block, wait and resume instead of exiting
     tile_retry_interval_s: float = 900.0    # how often to probe a blocked tile server
@@ -84,6 +89,13 @@ class Config:
     throttle_growth: float = 2.0
     max_consecutive_api_errors: int = 150
 
+    # batched metadata: one /images?image_ids=a,b,c call replaces up to
+    # entity_batch_size single-image lookups. treated as an optimisation the
+    # client can switch off mid-run, so a batching regression degrades to the
+    # old path instead of stopping collection
+    use_entity_batching: bool = True
+    entity_batch_size: int = 50
+
     # image validation
     min_image_bytes: int = 4096
     min_width: int = 256
@@ -97,6 +109,7 @@ class Config:
     drain_timeout_s: float = 1800.0
     status_every: int = 200
     log_level: str = "INFO"
+    sqlite_cache_mb: int = 64         # passed to StateDB as a negative KiB pragma
 
     # derived paths
 

@@ -13,8 +13,8 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .constants import TILE_PENDING
-from .utils import utc_now_iso
+from mapillary_collector.constants import TILE_PENDING
+from mapillary_collector.utils import utc_now_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS images(

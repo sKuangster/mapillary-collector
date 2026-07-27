@@ -66,7 +66,7 @@ class TileServerDown:
         self.graph_limiter = AdaptiveRateLimiter(0, 0, 1, 1)
         self.calls = 0
 
-    def fetch_coverage_tile(self, z, x, y):
+    def fetch_coverage_tile(self, z, x, y, layer=None):
         self.calls += 1
         raise TileUnavailableError(f"non-tile body (z={z} x={x} y={y}): '<!doctype'")
 
@@ -76,6 +76,15 @@ class TileServerDown:
     def fetch_image_bytes(self, url, ctx):
         raise AssertionError("should never download")
 
+    def get_images_batch(self, image_ids):
+        out = {}
+        for image_id in image_ids:
+            meta = self.get_image(image_id)
+            if meta is not None:
+                out[str(image_id)] = meta
+        return out
+
+
 
 class WorkingTiles:
     """Serves synthetic coverage so a country genuinely has data."""
@@ -84,7 +93,7 @@ class WorkingTiles:
         self.cfg = cfg
         self.graph_limiter = AdaptiveRateLimiter(0, 0, 1, 1)
 
-    def fetch_coverage_tile(self, z, x, y):
+    def fetch_coverage_tile(self, z, x, y, layer=None):
         w, s, e, n = geo.tile_bounds(z, x, y)
         if e < 0 or w > 10 or n < 0 or s > 10:
             return None
@@ -122,6 +131,15 @@ class WorkingTiles:
     def fetch_image_bytes(self, url, ctx):
         return make_jpeg()
 
+    def get_images_batch(self, image_ids):
+        out = {}
+        for image_id in image_ids:
+            meta = self.get_image(image_id)
+            if meta is not None:
+                out[str(image_id)] = meta
+        return out
+
+
 
 def _discovery(cfg, client, db, rec=REC):
     return TileDiscovery(cfg, client, db, rec, prep(rec.geometry), null_log())
@@ -148,7 +166,7 @@ def test_permanent_failure_still_marks_a_tile_dead(tmp_path):
     db.add_pending_tiles("Testland", [(10, 5, 5, 1)])
 
     class PermanentlyBroken(TileServerDown):
-        def fetch_coverage_tile(self, z, x, y):
+        def fetch_coverage_tile(self, z, x, y, layer=None):
             raise MapillaryError("http 400 permanent")
 
     disc = _discovery(cfg, PermanentlyBroken(cfg), db)
@@ -253,7 +271,7 @@ def test_genuinely_empty_country_is_marked_exhausted(tmp_path, monkeypatch):
     cfg = cfg_for(tmp_path)
 
     class NoCoverage(WorkingTiles):
-        def fetch_coverage_tile(self, z, x, y):
+        def fetch_coverage_tile(self, z, x, y, layer=None):
             return {"features": []}
 
     pipe = Pipeline(cfg, null_log())
