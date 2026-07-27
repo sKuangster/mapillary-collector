@@ -30,6 +30,10 @@ MAPILLARY_FIELDS = (
 
 SHARD_NAME_FMT = "shard-{idx:06d}.tar"
 
+# a densely covered spot (central Berlin) used to probe whether the tile server
+# is answering. any tile works; a well-covered one also proves data comes back
+TILE_PROBE_LNGLAT = (13.405, 52.52)
+
 WEB_MERCATOR_MAX_LAT = 85.05112878  # spherical mercator singularity guard
 
 # shard lifecycle

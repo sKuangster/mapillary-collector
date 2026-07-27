@@ -65,6 +65,11 @@ class Config:
     max_tile_failures: int = 40       # unreadable tiles before stopping the run
     retry_exhausted: bool = False     # revisit countries previously found empty
 
+    # unattended operation
+    forever: bool = True              # on tile block, wait and resume instead of exiting
+    tile_retry_interval_s: float = 900.0    # how often to probe a blocked tile server
+    idle_heartbeat_s: float = 1800.0        # log a heartbeat while waiting
+
     # networking
     workers: int = 6                  # parallel image fetches (network-bound, not CPU)
     request_timeout_s: float = 20.0

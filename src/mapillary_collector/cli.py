@@ -39,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quota-alpha", type=float, help="quota exponent (0.5 = sqrt)")
     run.add_argument("--include-panoramas", action="store_true", default=None)
     run.add_argument("--min-quality", type=float, dest="min_quality_score")
+    run.add_argument("--once", action="store_true", default=None,
+                     help="single pass, then exit (default: wait out tile limits "
+                          "and keep going until every country is done)")
+    run.add_argument("--tile-retry-minutes", type=float, default=None,
+                     help="how often to re-probe a blocked tile server")
     run.add_argument("--retry-exhausted", action="store_true", default=None,
                      dest="retry_exhausted",
                      help="revisit countries previously found to have no coverage")
@@ -84,6 +89,10 @@ def config_from_args(args: argparse.Namespace) -> Config:
         "min_quality_score": getattr(args, "min_quality_score", None),
         "dry_run_uploads": getattr(args, "dry_run_uploads", None),
         "retry_exhausted": getattr(args, "retry_exhausted", None),
+        "forever": False if getattr(args, "once", None) else None,
+        "tile_retry_interval_s": (
+            args.tile_retry_minutes * 60
+            if getattr(args, "tile_retry_minutes", None) else None),
     }
     countries = getattr(args, "countries", None)
     if countries:

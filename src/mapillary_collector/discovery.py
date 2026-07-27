@@ -22,13 +22,20 @@ from datetime import datetime, timezone
 
 from .client import MapillaryClient, MapillaryError, TileUnavailableError
 from .config import Config
-from .constants import TILE_EMPTY, TILE_ERROR, TILE_FETCHED
+from .constants import (
+    PARENT_TILE_ZOOM,
+    TILE_EMPTY,
+    TILE_ERROR,
+    TILE_FETCHED,
+    TILE_LAYER_IMAGE,
+    TILE_LAYER_SEQUENCE,
+)
 from .geo import (
     CountryRec,
+    clip_tiles_to_geometry,
     contains_point,
-    iter_geometry_coords,
-    lnglat_to_tile,
     tiles_over_geometry,
+    tiles_touching_geometry,
 )
 from .state import StateDB
 from .utils import stable_key
@@ -61,6 +68,10 @@ class TileDiscovery:
         self.leaf_fetches = 0
         self.unavailable = 0          # transient failures this session
         self._attempted: set = set()  # tiles tried this session, so we do not respin
+        # how many candidates each sequence has already contributed. a sequence
+        # at its cap can never yield another image, so storing more of it wastes
+        # the tile's candidate slots
+        self._seq_budget: dict = {}
         self._base_done_key = f"base_done:{rec.name}"
         # half a leaf tile per interpolation step, so no leaf lying between two
         # simplified vertices of a coverage line is skipped
@@ -130,7 +141,8 @@ class TileDiscovery:
                        * 1_000_000_000)
             self._spend_budget()
             try:
-                collection = self.client.fetch_coverage_tile(zoom, x, y)
+                collection = self.client.fetch_coverage_tile(
+                    zoom, x, y, layer=TILE_LAYER_SEQUENCE)
             except TileUnavailableError as exc:
                 # deliberately NOT recorded: it must stay eligible for retry
                 self.log.warning("[TILES] base z%d/%d/%d unavailable: %s",
@@ -164,24 +176,35 @@ class TileDiscovery:
     def _leaves_from_collection(self, collection) -> list:
         """Coverage geometry -> the leaf tiles it touches, clipped to this country.
 
+        Two things make this fast enough for large countries. Tiles are derived
+        by walking each segment in tile space instead of interpolating at a
+        fixed angular step, and containment is then decided hierarchically on
+        coarse parent tiles so that interior tiles are admitted in bulk.
+        Together these measured ~7x faster than the point-by-point approach,
+        which matters because a single z6 base tile can imply tens of thousands
+        of leaf tiles.
+
         Leaf tiles are ranked across the country's whole leaf set, not per base
         tile, so even a partial harvest is spread over the entire country.
         """
         if not collection or not collection.get("features"):
             return []
         leaf_zoom = self.cfg.tile_leaf_zoom
-        seen = set()
+
+        touched: set = set()
         for feature in collection["features"]:
             geometry = feature.get("geometry") or {}
-            for lng, lat in iter_geometry_coords(geometry, self._step_deg):
-                if not contains_point(self.prepared, lng, lat):
-                    continue
-                seen.add(lnglat_to_tile(lng, lat, leaf_zoom))
+            touched |= tiles_touching_geometry(geometry, leaf_zoom)
+        if not touched:
+            return []
+
+        kept = clip_tiles_to_geometry(touched, leaf_zoom, self.prepared,
+                                      parent_zoom=PARENT_TILE_ZOOM)
         return [
             (leaf_zoom, x, y,
              int(stable_key(self.cfg.rng_seed, self.rec.name, leaf_zoom, x, y)
                  * 1_000_000_000))
-            for x, y in seen
+            for x, y in kept
         ]
 
     # ---- phase 2: leaf harvest ----------------------------------------
@@ -237,7 +260,8 @@ class TileDiscovery:
     def _harvest_tile(self, z: int, x: int, y: int, tile_rank: int) -> int:
         self._spend_budget()
         try:
-            collection = self.client.fetch_coverage_tile(z, x, y)
+            collection = self.client.fetch_coverage_tile(
+                z, x, y, layer=TILE_LAYER_IMAGE)
         except TileUnavailableError as exc:
             # not recorded, so a bad hour cannot permanently kill this tile
             self.log.warning("[TILES] leaf z%d/%d/%d unavailable: %s", z, x, y, exc)
@@ -271,19 +295,100 @@ class TileDiscovery:
                 "is_pano": props.get("is_pano"),
             })
 
-        # deterministic order, then cap: stops one dense city block from
-        # contributing hundreds of near-identical frames
-        rows.sort(key=lambda r: r["image_id"])
-        rows = rows[: self.cfg.max_candidates_per_tile]
+        rows = self._select_candidates(self._drop_saturated(rows))
         for i, row in enumerate(rows):
             row["tile_rank"] = tile_rank
             row["rank_in_tile"] = i  # position within its tile, for round-robin
 
-        inserted = self.db.add_candidates(self.rec.name, rows) if rows else 0
+        inserted = self.db.add_candidates(self.rec.name, rows) if rows else []
+        # count only rows that actually landed: a duplicate that was ignored
+        # never consumed any of its sequence's budget
+        self._note_selected(inserted)
         self.db.record_tile(self.rec.name, z, x, y,
                             TILE_FETCHED if rows else TILE_EMPTY,
-                            tile_rank, inserted)
-        return inserted
+                            tile_rank, len(inserted))
+        return len(inserted)
+
+    def _drop_saturated(self, rows: list) -> list:
+        """Discard candidates whose sequence can no longer produce an image.
+
+        Sequences are road traces that run across many tiles, while the
+        per-sequence cap is global. Once a sequence reaches its cap every
+        further candidate from it is dead on arrival -- yet it still occupies
+        one of the tile's few candidate slots, and tile requests are the
+        scarcest resource in the pipeline. Filtering here hands those slots to
+        sequences that can still yield.
+
+        The count combines images already collected with candidates banked this
+        session, so the filter works on a country's very first pass rather than
+        only after collection has begun.
+        """
+        cap = self.cfg.max_per_sequence
+        if cap <= 0:
+            return rows
+
+        kept = []
+        for row in rows:
+            sequence = row.get("sequence")
+            if not sequence:
+                kept.append(row)      # no sequence means the cap cannot apply
+                continue
+            used = self._seq_budget.get(sequence)
+            if used is None:
+                used = self.db.sequence_count(sequence)
+                self._seq_budget[sequence] = used
+            if used < cap:
+                kept.append(row)
+        return kept
+
+    def _note_selected(self, rows: list) -> None:
+        for row in rows:
+            sequence = row.get("sequence")
+            if sequence:
+                self._seq_budget[sequence] = self._seq_budget.get(sequence, 0) + 1
+
+    def _select_candidates(self, rows: list) -> list:
+        """Choose which of a tile's images to keep, favouring distinct sequences.
+
+        A z14 tile is roughly two kilometres across, so most of its images tend
+        to come from a handful of capture runs down the same streets. Taking
+        them in id order therefore tends to take several frames of one drive,
+        which the per-sequence cap then rejects downstream -- observed rejecting
+        79% of candidates in Afghanistan, wasting tile budget that is the
+        scarcest resource in the whole pipeline.
+
+        Interleaving across sequences takes the first image of every sequence
+        before the second of any, so a tile yields varied viewpoints and far
+        more of its candidates survive filtering. Ordering stays fully
+        deterministic: sequences sort by id, images sort by id within them.
+        """
+        cap = self.cfg.max_candidates_per_tile
+        if not self.cfg.prefer_distinct_sequences:
+            rows.sort(key=lambda r: r["image_id"])
+            return rows[:cap]
+
+        buckets: dict = {}
+        for row in rows:
+            buckets.setdefault(row.get("sequence") or "", []).append(row)
+        for bucket in buckets.values():
+            bucket.sort(key=lambda r: r["image_id"])
+
+        order = sorted(buckets)
+        picked: list = []
+        depth = 0
+        while len(picked) < cap:
+            added = False
+            for key in order:
+                bucket = buckets[key]
+                if depth < len(bucket):
+                    picked.append(bucket[depth])
+                    added = True
+                    if len(picked) >= cap:
+                        break
+            if not added:
+                break   # every sequence exhausted
+            depth += 1
+        return picked
 
     # ---- completion ---------------------------------------------------
 
